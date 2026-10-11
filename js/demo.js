@@ -9,16 +9,27 @@
   const frame = document.querySelector('iframe');
   const app = () => (frame ? frame.contentDocument : document);
   let pace = 1;                                            // scales every wait in a scene: below 1 is faster
-  const sleep = ms => new Promise(r => setTimeout(r, ms * pace));
+  // Every wait in a scene goes through sleep(), which can be paused (it stops counting) or cancelled (it throws).
+  let paused = false, pausedAt = 0, pausedMs = 0, gen = 0;
+  const active = () => Date.now() - pausedMs - (paused ? Date.now() - pausedAt : 0);   // the clock minus time spent paused
+  const sleepers = new Set();
+  let lastTick = Date.now();
+  setInterval(() => {
+    const now = Date.now(), dt = now - lastTick;
+    lastTick = now;
+    if (paused) return;
+    sleepers.forEach(w => { w.left -= dt; if (w.left <= 0) { sleepers.delete(w); w.res(); } });
+  }, 40);
+  const sleep = ms => new Promise((res, rej) => sleepers.add({ left: ms * pace, res, rej }));
   const appWin = () => (frame ? frame.contentWindow : window);
   let running = false;
 
   async function waitFor(find, timeout = 5000) {
-    const end = Date.now() + timeout;
+    const end = active() + timeout;
     for (;;) {
       const found = find();
       if (found) return found;
-      if (Date.now() > end) throw new Error('demo: element not found');
+      if (active() > end) throw new Error('demo: element not found');
       await sleep(60);
     }
   }
@@ -336,28 +347,32 @@
     { label: 'scene4', title: 'Not sure what to pick?', play: scene4 }
   ];
   const buttons = [];
-  const lock = on => buttons.forEach(b => { b.disabled = on; b.style.opacity = on ? .4 : .7; });
+  const lock = on => {
+    buttons.forEach(b => { b.disabled = on; b.style.opacity = on ? .4 : .7; });
+    if (typeof pauseBtn !== 'undefined') { pauseBtn.disabled = !on; pauseBtn.style.opacity = on ? .7 : .4; }
+  };
 
   async function runScene(sc) {
-    const t0 = Date.now();
+    const t0 = active();
     showTitle(sc.title);
     app().documentElement.classList.add('demo-playing');   // hides the touch dot
     pace = sc.pace || 1;
-    try { await sc.play(); } catch (e) { console.warn(e.message); }
+    try { await sc.play(); } catch (e) { if (e.message === 'stopped') throw e; console.warn(e.message); }
     pace = 1;
-    console.debug(`demo: ${sc.label} played in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+    console.debug(`demo: ${sc.label} played in ${((active() - t0) / 1000).toFixed(1)}s`);
     app().documentElement.classList.remove('demo-playing');
     await sleep(1200);                                     // short hold on the final state
     hideTitle(); hideSay();
     await sleep(300);
-    return (Date.now() - t0) / 1000;
+    return (active() - t0) / 1000;
   }
 
   SCENES.forEach(sc => buttons.push(addButton(sc.label, async () => {
     if (running) return;
     running = true; lock(true);
-    await runScene(sc);
-    running = false; lock(false);
+    const g = gen;
+    try { await runScene(sc); } catch (e) { if (e.message !== 'stopped') console.warn(e.message); }
+    if (g === gen) { running = false; lock(false); }       // a stop has already reset everything
   })));
 
   // Full screen for the whole page (the phone frame included); press again to leave.
@@ -377,18 +392,72 @@
   const all = addButton('run all', async () => {
     if (running) return;
     running = true; lock(true);
-    const start = Date.now();
-    clock.style.display = 'block';
-    const tickClock = setInterval(() => { clock.textContent = '⏱ ' + mmss((Date.now() - start) / 1000); }, 250);
-    if (!document.fullscreenElement) await Promise.race([document.documentElement.requestFullscreen().catch(e => console.warn(e.message)), sleep(3000)]);   // never wait on it for long
-    await sleep(1500);
-    const times = [];
-    for (const sc of SCENES) { times.push(await runScene(sc)); await sleep(300); }
+    const g = gen;
+    let tickClock = 0;
+    try {
+      clock.style.display = 'block';
+      if (!document.fullscreenElement) {
+        const giveUp = sleep(3000);
+        giveUp.catch(() => {});                              // a stop rejects it; nobody is waiting on it then
+        await Promise.race([document.documentElement.requestFullscreen().catch(e => console.warn(e.message)), giveUp]);   // never wait on it for long
+      }
+      await sleep(1500);
+
+      // 15 seconds to get ready before anything plays; this is not part of the timing
+      const READY_MS = 15000, ready = active();
+      while (active() - ready < READY_MS) {
+        clock.textContent = `${paused ? '⏸ ' : ''}Starting in ${Math.ceil((READY_MS - (active() - ready)) / 1000)}s`;
+        await sleep(200);
+      }
+
+      const start = active();                              // the timer starts here
+      tickClock = setInterval(() => { clock.textContent = (paused ? '⏸ ' : '⏱ ') + mmss((active() - start) / 1000); }, 250);
+      const times = [];
+      for (const sc of SCENES) { times.push(await runScene(sc)); await sleep(300); }
+      clearInterval(tickClock);
+      const total = (active() - start) / 1000;
+      clock.textContent = `⏱ Run all: ${mmss(total)} (${total.toFixed(1)}s)\n` + SCENES.map((sc, i) => `${sc.label} ${mmss(times[i])}`).join(' · ');
+      console.info(clock.textContent);
+    } catch (e) { if (e.message !== 'stopped') console.warn(e.message); }
     clearInterval(tickClock);
-    const total = (Date.now() - start) / 1000;
-    clock.textContent = `⏱ Run all: ${mmss(total)} (${total.toFixed(1)}s)\n` + SCENES.map((sc, i) => `${sc.label} ${mmss(times[i])}`).join(' · ');
-    console.info(clock.textContent);
-    running = false; lock(false);
+    if (g === gen) { running = false; lock(false); }
   });
   buttons.push(all);
+
+  /* ---------- pause and stop ---------- */
+  // Pause freezes every wait and the timer. The app's own task countdowns would keep running, so they are pushed back by the time paused.
+  const pauseBtn = addButton('pause', () => {
+    if (!running) return;
+    if (!paused) { paused = true; pausedAt = Date.now(); pauseBtn.textContent = 'resume'; return; }
+    const ms = Date.now() - pausedAt;
+    pausedMs += ms; paused = false; pauseBtn.textContent = 'pause';
+    try { appWin().eval(`(function (ms) { state.tasks.forEach(t => { if (t.status === 'active') t.deadline += ms; }); saveState(); })(${ms})`); } catch (e) { /* not signed in yet: nothing to move */ }
+  });
+
+  pauseBtn.disabled = true; pauseBtn.style.opacity = .4;     // only usable while something plays
+
+  // Stop: cancel whatever is playing and put the app back on the empty registration form.
+  function resetApp() {
+    Object.keys(localStorage).filter(k => k.startsWith('commit_') && k !== 'commit_theme').forEach(k => localStorage.removeItem(k));   // accounts, sessions, tasks, setup flags
+    if (frame) {
+      frame.addEventListener('load', () => setTimeout(() => appWin().setAuthMode('signup'), 100), { once: true });
+      frame.contentWindow.location.reload();
+    } else {
+      sessionStorage.setItem('demo-signup', '1');
+      location.reload();
+    }
+  }
+  const stopBtn = addButton('stop', () => {
+    gen++;
+    sleepers.forEach(w => w.rej(new Error('stopped'))); sleepers.clear();
+    paused = false; pace = 1; pauseBtn.textContent = 'pause';
+    running = false; lock(false);
+    hideTitle(true); hideSay();
+    clock.style.display = 'none';
+    resetApp();
+  });
+  if (!frame && sessionStorage.getItem('demo-signup')) {   // came back from a stop on a plain (unframed) page
+    sessionStorage.removeItem('demo-signup');
+    window.addEventListener('load', () => setTimeout(() => window.setAuthMode('signup'), 100));
+  }
 })();
