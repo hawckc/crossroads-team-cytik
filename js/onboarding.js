@@ -38,6 +38,7 @@ const ONBOARDING = (function () {
   let renderToken = 0;
   let guideHTML = '';                  // the robot on the results screen, shown above the footer
   let fresh = false;                   // true right after registration
+  let startKey = null;                 // one idempotency key per setup, so a retried start does not create the tasks twice
 
   const el = id => document.getElementById(id);
   const optionsFor = id => ({ area: GUIDE.AREA.options, blocker: GUIDE.BLOCKER.options, when: GUIDE.WHEN.options, stake: GUIDE.STAKE.options }[id]);
@@ -185,7 +186,7 @@ const ONBOARDING = (function () {
   function answered() {
     const s = STEPS[step];
     if (s.id === 'welcome') return true;
-    if (s.id === 'results') return chosen.size > 0 && totalStake() <= state.balance;
+    if (s.id === 'results') return chosen.size > 0 && totalStake() <= spendable();
     if (MULTI[s.id]) return sel[MULTI[s.id].key].length > 0;
     return !!sel[s.id];
   }
@@ -200,8 +201,8 @@ const ONBOARDING = (function () {
     else if (s.id === 'stake') next.textContent = 'See suggestions';
     else if (s.id === 'results') {
       next.textContent = chosen.size ? `Start ${chosen.size} task${chosen.size > 1 ? 's' : ''}` : 'Choose one';
-      if (chosen.size && totalStake() > state.balance) {
-        note.textContent = `${fmtMoney(totalStake())} is more than your balance (${fmtMoney(state.balance)})`;
+      if (chosen.size && totalStake() > spendable()) {
+        note.textContent = `${fmtMoney(totalStake())} is more than your balance (${fmtMoney(spendable())})`;
         note.classList.add('bad');
       } else if (chosen.size) note.textContent = `${fmtMoney(totalStake())} at stake`;
     } else next.textContent = 'Continue';
@@ -250,6 +251,7 @@ const ONBOARDING = (function () {
   function startChosen() {
     const now = Date.now();
     const list = [...chosen].sort().map(i => picks[i]);
+    if (HTTP) return startChosenOnServer(list, now);
     list.forEach(r => {
       const due = new Date(now);
       due.setDate(due.getDate() + r.days);
@@ -266,14 +268,34 @@ const ONBOARDING = (function () {
     list.filter(r => r.partner).forEach(r => toast(`Show code ${r.code} at ${r.partnerName}`, 'success'));
   }
 
+  // With the backend: the tasks and the answers are saved on the server, and the setup is closed once both have gone through.
+  async function startChosenOnServer(list, now) {
+    const tasks = list.map(r => {
+      const due = new Date(now);
+      due.setDate(due.getDate() + r.days);
+      due.setHours(18, 0, 0, 0);                          // due that evening, a realistic cut-off
+      return { name: r.name, icon: r.icon, byDate: true, deadline: due.getTime(), penalty: r.stake };
+    });
+    const profile = { areas: sel.areas, blockers: sel.blockers, whens: sel.whens, blocker: prefs().blocker, when: prefs().when, stake: sel.stake && sel.stake.id };
+    if (tasks.length && !(await act(() => API.createTasks(tasks, startKey || (startKey = uid()))))) return;
+    if (!(await act(() => API.setProfile(profile, true, sel.stake && sel.stake.id)))) return;
+    finish();
+    showView('home');
+    toast(`Started ${list.length}`, 'success');
+    list.filter(r => r.partner).forEach(r => toast(`Show code ${r.code} at ${r.partnerName}`, 'success'));
+  }
+
   function finish() {
-    localStorage.setItem(keyFor(LS_ONBOARDED), '1');
+    if (HTTP) {
+      if (!state.onboarded) { state.onboarded = true; API.setProfile(null, true).then(r => applyServer(r.state)).catch(() => {}); }
+    } else localStorage.setItem(keyFor(LS_ONBOARDED), '1');
     el('overlay-onb').classList.add('hidden');
     document.body.classList.remove('no-scroll');
   }
 
   function open(opts) {
     fresh = !!(opts && opts.registered);
+    startKey = null;
     step = 0; dir = 1; sel = { areas: [], blockers: [], whens: [] }; picks = []; chosen = new Set();
     el('overlay-onb').classList.remove('hidden');
     document.body.classList.add('no-scroll');

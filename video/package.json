@@ -10,7 +10,8 @@
     "all": "npm run screens && npm run record && npm run films",
     "films": "node tools/render-animatic.mjs all",
     "mp4-flow": "ffmpeg -y -i clips/flow.webm -vf fps=30,scale=720:-2 -c:v libx264 -crf 20 -pix_fmt yuv420p -movflags +faststart films/app-flow.mp4",
-    "inserts": "node tools/build-inserts.mjs"
+    "inserts": "node tools/build-inserts.mjs",
+    "tutorial-screens": "node tools/capture-tutorial.mjs"
   },
   "devDependencies": {
     "playwright": "^1.64.0"

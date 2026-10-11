@@ -106,11 +106,62 @@ const LS_STATE = 'commit_state_v1', LS_USER = 'commit_user_v1', LS_USERS = 'comm
 let state = null;
 let currentUser = null;
 
+/* ---------- optional backend (js/api.js) ----------
+   Off unless ?api=1. Then the server owns the data: every action is sent to it, and `state` is replaced by what it answers. */
+const HTTP = API.on;
+
+// A retry length picked on an offer card but not yet accepted lives only here, so keep it across a refresh from the server.
+function applyServer(s) {
+  const picked = {};
+  if (state) state.tasks.forEach(t => { if (t.status === 'offer' && t.offerChoiceMs) picked[t.id] = t.offerChoiceMs; });
+  state = s;
+  state.tasks.forEach(t => { if (picked[t.id] && t.status === 'offer' && retryChoices(t).includes(picked[t.id])) t.offerChoiceMs = picked[t.id]; });
+}
+
+function apiFailure(e) {
+  if (e instanceof API.ApiError && e.status === 401) { toast('Signed out. Sign in again', 'error'); setTimeout(() => location.reload(), 900); return; }
+  toast(e instanceof API.ApiError ? e.message : 'Something went wrong', 'error');
+}
+
+// Runs one server action, swaps in the state it returns and redraws. Resolves to the answer, or null after showing the error.
+// One action at a time: these move money, so a double tap must not send twice.
+let acting = false, mutations = 0;
+async function act(call) {
+  if (acting) return null;
+  acting = true; mutations++;
+  try { const r = await call(); applyServer(r.state); renderAll(); return r; }
+  catch (e) { apiFailure(e); return null; }
+  finally { acting = false; }
+}
+
+// Pulls fresh state (the server settles missed deadlines) and redraws only if something changed.
+let lastSync = 0, syncBusy = false;
+async function syncSoon(minGap = 3000) {
+  if (!HTTP || !currentUser || syncBusy || acting || Date.now() - lastSync < minGap) return;
+  syncBusy = true; lastSync = Date.now();
+  try {
+    const before = new Map(state.tasks.map(t => [t.id, t.status]));
+    const sig = s => JSON.stringify([s.balance, s.spendable, s.tickets, s.extraRetries, s.tasks.map(t => [t.id, t.status, t.deadline, t.attempt])]);
+    const was = sig(state), seen = mutations;
+    const next = await API.sync();
+    if (acting || mutations !== seen) return;                        // an action finished meanwhile: this answer is older than the state it returned
+    if (sig(next) === was) return;
+    applyServer(next);
+    renderAll();
+    next.tasks.forEach(t => {                                        // tell the person what happened while they were away
+      const prev = before.get(t.id);
+      if (prev === 'active' && t.status === 'offer') { flash('try'); toast('Missed. One more try?', 'try'); }
+      else if ((prev === 'active' || prev === 'offer') && t.status === 'failed') { flash(); toast(`Missed "${t.name}". ${fmtMoney(t.charged || 0)} to ${(state.charities.find(c => c.id === t.charityId) || {}).name || 'charity'}`, 'warn'); }
+    });
+  } catch (e) { if (e instanceof API.ApiError && e.status === 401) apiFailure(e); }
+  finally { syncBusy = false; }
+}
+
 // Every account keeps its own data under its own key, so several people can use one browser.
 const keyFor = (base, u = currentUser && currentUser.username) => `${base}:${u}`;
 function loadState(u) { try { const raw = localStorage.getItem(keyFor(LS_STATE, u)); if (raw) return JSON.parse(raw); } catch (e) {} return null; }
 function saveState() {
-  if (!currentUser) return;
+  if (!currentUser || HTTP) return;                  // with the backend, the server is the only copy
   try { localStorage.setItem(keyFor(LS_STATE), JSON.stringify(state)); }
   catch (e) { toast('Storage is full', 'error'); }
 }
@@ -244,8 +295,19 @@ function startSession(u, opts = {}) {
   enterApp(opts);
 }
 
+// A session the server has already opened: `s` is its state.
+function startServerSession(s, opts = {}) {
+  currentUser = { username: s.user.username, name: s.user.name };
+  applyServer(s);
+  enterApp(opts);
+}
+
 // Sign in only. A username that does not exist is an error, with an offer to create it.
 async function handleLogin(rawName, password) {
+  if (HTTP) {
+    try { startServerSession((await API.login(rawName.trim(), password)).state); return null; }
+    catch (e) { return { message: e.message, signup: e.code === 'NO_SUCH_USER' }; }
+  }
   const u = rawName.trim().toLowerCase();
   const user = getUsers()[u];
   if (!user) return { message: 'No account with that username', signup: true };
@@ -281,9 +343,13 @@ function validateRegistration(v) {
 }
 
 // Creates the account and signs in. Returns null on success, or the validation errors.
-function registerAccount(v) {
+async function registerAccount(v) {
   const errors = validateRegistration(v);
   if (Object.keys(errors).length) return errors;
+  if (HTTP) {
+    try { startServerSession((await API.register(v)).state, { registered: true }); return null; }
+    catch (e) { return e.details && typeof e.details === 'object' ? e.details : { username: e.message }; }
+  }
   const u = v.username.trim().toLowerCase();
   const stored = JSON.parse(localStorage.getItem(LS_USERS) || '{}');
   stored[u] = { password: v.password, name: v.name.trim(), createdAt: Date.now() };
@@ -293,6 +359,7 @@ function registerAccount(v) {
 }
 
 function logout() {
+  if (HTTP) { API.logout().catch(() => {}).finally(() => location.reload()); return; }
   localStorage.removeItem(LS_SESSION);
   location.reload();
 }
@@ -324,7 +391,7 @@ function enterApp(opts = {}) {
   renderAll();
   showView('home');
   // accounts that have not done the setup get the questions; a brand new account gets them immediately
-  if (!localStorage.getItem(keyFor(LS_ONBOARDED))) {
+  if (!(HTTP ? state.onboarded : localStorage.getItem(keyFor(LS_ONBOARDED)))) {
     if (opts.registered) ONBOARDING.open({ registered: true });
     else setTimeout(() => ONBOARDING.open(), 400);
   }
@@ -586,7 +653,7 @@ const retryChoices = t => [...new Set([defaultRetryMs(t), 3600000, 4 * 3600000, 
 // Four free retries a month, then bought ones. The free count starts over each calendar month.
 const monthKey = (d = new Date()) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
 function freeRetriesLeft() {
-  if (state.retries.month !== monthKey()) state.retries = { month: monthKey(), used: 0 };
+  if (!HTTP && state.retries.month !== monthKey()) state.retries = { month: monthKey(), used: 0 };   // with the backend, its count (in the account's timezone) is the one that applies
   return Math.max(0, RETRIES_PER_MONTH - state.retries.used);
 }
 const retriesLeft = () => freeRetriesLeft() + state.extraRetries;
@@ -597,7 +664,7 @@ function useRetry() {                                                // free one
 
 // Stakes held for an open offer can't be spent on tickets or new tasks until the offer ends.
 const heldStake = () => state.tasks.filter(t => t.status === 'offer').reduce((sum, t) => sum + t.penalty, 0);
-const spendable = () => Math.max(0, state.balance - heldStake());
+const spendable = () => (HTTP ? state.spendable : Math.max(0, state.balance - heldStake()));   // the server reserves stakes when a task starts
 
 function failTask(t) {
   if ((t.attempt || 1) < 2) {
@@ -642,6 +709,15 @@ async function bailOut(id) {
   if (!t || t.status !== 'active' || (t.attempt || 1) === 2) return;   // no bailing out of a retry
   if (state.tickets < 1) {
     toast('No tickets left. Buy one in the Shop', 'error');     // stay on this screen
+    return;
+  }
+  if (HTTP) {
+    const card = document.querySelector(`.task-card[data-task-id="${id}"]`);
+    $('#tasks-active-list').classList.add('still');
+    if (card && !reduceMotion()) { card.classList.add('leaving'); await sleep(200); }
+    const r = await act(() => API.bail(id));
+    if (!r) { if (card) card.classList.remove('leaving'); return; }
+    toast(`Cleared "${t.name}". ${state.tickets} ticket${state.tickets === 1 ? '' : 's'} left`, 'success');
     return;
   }
   state.tickets -= 1;
@@ -738,6 +814,7 @@ function buyRetries(n) {
   const cost = packCost(n, 'retry');
   if (!RETRY_PACKS.includes(n)) return;
   if (cost > spendable()) { toast(`Not enough balance (${fmtMoney(spendable())})`, 'error'); return; }
+  if (HTTP) { act(() => API.buy('retry', n, uid())).then(r => r && toast(`${n} ${n > 1 ? 'retries' : 'retry'} added`, 'success')); return; }
   state.balance -= cost;
   state.extraRetries += n;
   pushActivity('↩️', `Bought ${n} ${n > 1 ? 'retries' : 'retry'} for ${fmtMoney(cost)}`, 'ticket');
@@ -750,6 +827,7 @@ function buyTickets(n) {
   const cost = packCost(n, 'bail');
   if (!TICKET_PACKS.includes(n)) return;
   if (cost > spendable()) { toast(`Not enough balance (${fmtMoney(spendable())})`, 'error'); return; }
+  if (HTTP) { act(() => API.buy('bail', n, uid())).then(r => r && toast(`${n} ticket${n > 1 ? 's' : ''} added`, 'success')); return; }
   state.balance -= cost;
   state.tickets += n;
   pushActivity('🎫', `Bought ${n} bail-out ticket${n > 1 ? 's' : ''} for ${fmtMoney(cost)}`, 'ticket');
@@ -761,8 +839,12 @@ function buyTickets(n) {
 function acceptOffer(id) {
   const t = taskById(id);
   if (!t || t.status !== 'offer') return;
-  if (Date.now() >= t.offerExpiresAt) { chargeMiss(t, false); renderAll(); return; }   // it lapsed between ticks
+  if (Date.now() >= t.offerExpiresAt) { if (HTTP) syncSoon(0); else { chargeMiss(t, false); renderAll(); } return; }   // it lapsed between ticks
   if (retriesLeft() < 1) { toast('No retries left. Get more in the Shop', 'error'); showView('shop'); return; }
+  if (HTTP) {
+    act(() => API.retry(id, t.offerChoiceMs || defaultRetryMs(t))).then(r => { const u = r && taskById(id); if (u) toast(`One more try. Finish by ${fmtDeadline(u.deadline)}`, 'success'); });
+    return;
+  }
   useRetry();
   const ms = t.offerChoiceMs || defaultRetryMs(t), now = Date.now();
   t.status = 'active';
@@ -781,6 +863,10 @@ function acceptOffer(id) {
 function declineOffer(id) {
   const t = taskById(id);
   if (!t || t.status !== 'offer') return;
+  if (HTTP) {
+    act(() => API.decline(id)).then(r => { const u = r && taskById(id); if (u) toast(`Missed "${u.name}". ${fmtMoney(u.charged || 0)} to ${(state.charities.find(c => c.id === u.charityId) || {}).name || 'charity'}`, 'warn'); });
+    return;
+  }
   chargeMiss(t, false);
   renderAll();
 }
@@ -817,6 +903,7 @@ function offerCardHTML(t) {
 }
 
 function completeTask(t, proof) {
+  if (HTTP) { celebrate(t, proof); return; }                      // the server completed it, and renderAll already ran
   t.status = 'completed';
   t.completedAt = Date.now();
   if ((t.attempt || 1) === 2) t.wonBack = true;                   // the retry succeeded, so the held stake comes back
@@ -851,7 +938,9 @@ function startTick() { if (tickTimer) clearInterval(tickTimer); tickTimer = setI
 function tick() {
   if (!currentUser) return;   // timers only run (and expire) for a signed-in user
   let expired = false;
-  state.tasks.forEach(t => {
+  if (HTTP) {                                                   // the server settles missed deadlines; ask it when one is due
+    if (state.tasks.some(t => (t.status === 'active' && Date.now() >= t.deadline) || (t.status === 'offer' && Date.now() >= t.offerExpiresAt))) syncSoon();
+  } else state.tasks.forEach(t => {
     if (t.status === 'active' && Date.now() >= t.deadline) { failTask(t); expired = true; }
     else if (t.status === 'offer' && Date.now() >= t.offerExpiresAt) { chargeMiss(t, false); expired = true; }   // the offer lapsed
   });
@@ -1102,6 +1191,11 @@ function submitAddTask(e) {
   if (!when.ok) { toast(when.error, 'error'); return; }
   if (penalty > spendable()) { toast(`Stake is above your balance (${fmtMoney(spendable())})`, 'error'); return; }
 
+  if (HTTP) {
+    const task = { name, icon: selectedIcon || iconFor(name), byDate: addMode === 'date', deadline: when.deadline, penalty };
+    act(() => API.createTask(task, uid())).then(r => { if (r) { closeAddTask(); toast(`Started. Due ${fmtDeadline(when.deadline)}`, 'success'); } });
+    return;
+  }
   state.tasks.unshift({
     id: uid(), name, icon: selectedIcon || iconFor(name), status: 'active', byDate: addMode === 'date',
     createdAt: Date.now(), deadline: when.deadline, durationMs: when.durationMs, penalty
@@ -1156,6 +1250,10 @@ function renderCharities() {
 function selectCharity(id) {
   const c = state.charities.find(x => x.id === id);
   if (!c || c.id === state.selectedCharityId) return;
+  if (HTTP) {
+    act(() => API.setCharity(id)).then(r => { if (r) { window.scrollTo({ top: 0, behavior: reduceMotion() ? 'auto' : 'smooth' }); toast(`Charity: ${c.name}`, 'success'); } });
+    return;
+  }
   state.selectedCharityId = id;
   saveState();
   renderCharities();
@@ -1174,6 +1272,7 @@ function renderSettings() {
 function addFunds(amount) {
   const a = Math.round(+amount);
   if (!a || a <= 0) { toast('Enter an amount', 'error'); return; }
+  if (HTTP) { act(() => API.addFunds(a, uid())).then(r => r && toast(`${fmtMoney(a)} added`, 'success')); return; }
   state.balance += a;
   pushActivity('💰', `Added ${fmtMoney(a)} to account`, 'funds');
   saveState();
@@ -1182,6 +1281,7 @@ function addFunds(amount) {
 }
 
 function resetDemoData() {
+  if (HTTP) { act(() => API.reset()).then(r => { if (r) { showView('home'); toast('Reset', 'info'); } }); return; }
   localStorage.removeItem(keyFor(LS_STATE));
   state = normalizeState(newStateFor(currentUser.username));
   saveState();
@@ -1314,7 +1414,13 @@ async function runAnalysis() {
   $('#pf-image').src = pf.image;
   const t = taskById(pf.taskId);
 
-  const verdict = MOCK.verifyProof(t);                              // pretend check; the steps below are for show
+  // With the backend the photo goes to the server, which checks it and completes the task if it passes.
+  // Without it the check is pretend. The steps below are for show either way, and run while the answer is on its way.
+  let served = null;
+  const check = HTTP
+    ? API.proof(pf.taskId, pf.image).then(r => { served = r.state; return r.result; })
+        .catch(e => ({ error: e }))
+    : Promise.resolve(MOCK.verifyProof(t));
 
   for (const li of $$('#pf-step-list li')) {
     li.classList.add('active');
@@ -1323,6 +1429,16 @@ async function runAnalysis() {
     li.classList.add('done');
   }
 
+  const verdict = await check;
+  if (verdict.error) {                                              // not a verdict on the photo: the check could not run
+    const e = verdict.error;
+    if (e.status === 401) return apiFailure(e);
+    toast(e.message || 'The photo check failed', 'error');
+    if (e.status === 409) { closeProofFlow(); syncSoon(0); }        // the task is no longer running: show where it stands
+    else { pf.image = null; showPfStage('camera'); startCamera(); }
+    return;
+  }
+  if (served) { applyServer(served); renderAll(); }
   pf.result = { ...verdict, at: Date.now() };
   renderPfResult();
 }
@@ -1485,9 +1601,9 @@ function bindEvents() {
     $('#btn-toggle-reg-pass').textContent = show ? 'Hide' : 'Show';
     $('#btn-toggle-reg-pass').setAttribute('aria-label', show ? 'Hide passwords' : 'Show passwords');
   });
-  $('#register-form').addEventListener('submit', e => {
+  $('#register-form').addEventListener('submit', async e => {
     e.preventDefault();
-    const errors = registerAccount(regValues());
+    const errors = await registerAccount(regValues());
     if (!errors) return;
     renderRegister(true);
     const first = Object.keys(REG_FIELDS).find(k => errors[k]);
@@ -1609,6 +1725,7 @@ function bindEvents() {
   $('#btn-save-default').addEventListener('click', () => {
     const v = Math.round(+$('#default-penalty').value);
     if (!v || v < MIN_STAKE) return toast(`Minimum stake is ${fmtMoney(MIN_STAKE)}`, 'error');
+    if (HTTP) { act(() => API.setDefaultStake(v)).then(r => r && toast('Saved', 'success')); return; }
     state.defaultPenalty = v;
     saveState();
     toast('Saved', 'success');
@@ -1657,7 +1774,15 @@ function bindEvents() {
 }
 
 /* ---------- init ---------- */
-document.addEventListener('DOMContentLoaded', () => {
+document.addEventListener('DOMContentLoaded', async () => {
+  if (HTTP) {                                                     // the server holds the session; there is no localStorage account
+    bindEvents();
+    startTick();
+    try { const s = await API.session(); if (s) startServerSession(s); } catch (e) { apiFailure(e); }
+    setInterval(() => syncSoon(20000), 30000);                    // also pick up what the worker settled while the tab sat idle
+    document.addEventListener('visibilitychange', () => { if (!document.hidden) syncSoon(5000); });
+    return;
+  }
   migrateLegacy();
   bindEvents();
   startTick();
