@@ -55,17 +55,14 @@
     await sleep(fast ? 500 : 950);                                      // glide there
     cur.style.transform = 'scale(.8)';                     // press
     const ring = doc.createElement('div');
-    ring.style.cssText = `position:fixed;left:${x}px;top:${y}px;width:44px;height:44px;margin:-22px 0 0 -22px;border-radius:50%;background:rgba(255,80,80,.35);border:3px solid #ff5050;pointer-events:none;z-index:99998;transition:transform .7s,opacity .7s`;
+    ring.style.cssText = `position:fixed;left:${x}px;top:${y}px;width:44px;height:44px;margin:-22px 0 0 -22px;border-radius:50%;border:2px solid #fff;box-shadow:0 0 0 1px rgba(0,0,0,.35),inset 0 0 0 1px rgba(0,0,0,.2);pointer-events:none;z-index:99998;transition:transform .7s,opacity .7s`;
     doc.body.appendChild(ring);
     setTimeout(() => { ring.style.transform = 'scale(2.6)'; ring.style.opacity = '0'; }, 40);
     setTimeout(() => ring.remove(), 800);
-    const old = el.style.outline;
-    el.style.outline = '3px solid #ff5050';
     await sleep(fast ? 120 : 250);
     el.click();
     cur.style.transform = '';
     await sleep(350);
-    el.style.outline = old;
     if (!fast) await sleep(900);
   }
 
