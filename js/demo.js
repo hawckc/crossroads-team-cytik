@@ -52,18 +52,36 @@
   async function tap(target, fast = false) {
     const el = typeof target === 'string' ? await waitFor(q(target)) : target;
     const doc = el.ownerDocument;
-    const box = el.getBoundingClientRect(), vh = doc.defaultView.innerHeight;
-    if (box.top < 0 || box.bottom > vh) {                  // only scroll when it is off screen
+    // Scroll when it is off screen or something (such as the bottom nav) covers its centre, then wait for the scrolling to finish.
+    const covered = () => {
+      const b = el.getBoundingClientRect(), vh = doc.defaultView.innerHeight;
+      if (b.top < 0 || b.bottom > vh) return true;
+      const hit = doc.elementFromPoint(b.left + b.width / 2, b.top + b.height / 2);
+      return !!hit && !el.contains(hit);
+    };
+    for (let tries = 0; tries < 3 && covered(); tries++) {
       el.scrollIntoView({ block: 'center', behavior: 'smooth' });
-      await sleep(fast ? 150 : 500);
+      let last = null;
+      for (let i = 0; i < 30; i++) {                       // settled when its position stops changing
+        await sleep(60);
+        const b = el.getBoundingClientRect();
+        if (last && Math.abs(b.top - last.top) < 1 && Math.abs(b.left - last.left) < 1 && i > 2) break;
+        last = b;
+      }
     }
     const r = el.getBoundingClientRect();
-    const x = r.left + r.width / 2, y = r.top + r.height / 2;
+    let x = r.left + r.width / 2, y = r.top + r.height / 2;
     const cur = pointer(doc);
     const glide = (fast ? .4 : .8) * pace;
     cur.style.transitionDuration = `${glide}s,${glide}s,.15s`;
     cur.style.left = x + 'px'; cur.style.top = y + 'px';
     await sleep(fast ? 500 : 950);                                      // glide there
+    const r2 = el.getBoundingClientRect();                 // it may have moved while the pointer was travelling
+    if (Math.abs(r2.top - r.top) + Math.abs(r2.left - r.left) > 3) {
+      x = r2.left + r2.width / 2; y = r2.top + r2.height / 2;
+      cur.style.left = x + 'px'; cur.style.top = y + 'px';
+      await sleep(400);
+    }
     cur.style.transform = 'scale(.8)';                     // press
     const ring = doc.createElement('div');
     ring.style.cssText = `position:fixed;left:${x}px;top:${y}px;width:44px;height:44px;margin:-22px 0 0 -22px;border-radius:50%;border:2px solid #fff;box-shadow:0 0 0 1px rgba(0,0,0,.35),inset 0 0 0 1px rgba(0,0,0,.2);pointer-events:none;z-index:99998;transition:transform .7s,opacity .7s`;
@@ -292,7 +310,7 @@
     const d = app();
     if (!q('#btn-open-guide')()) await tap('[data-view="home"]');
     say('Not sure what to pick? The AI assistant can suggest a task for you.', '🤔');
-    await sleep(3500);
+    await sleep(2800);
     await tap('#btn-open-guide');                          // Get ideas
 
     // the chat asks about right now: mood, place, time, direction
@@ -301,15 +319,15 @@
     for (let i = 0; i < answers.length; i++) {
       const first = await waitFor(chip, 15000);
       if (i === 0) say('It asks about right now: your mood, where you are and how much time you have.', '💬');
-      await sleep(1500);
+      await sleep(1000);
       const chips = [...d.querySelectorAll('#guide-chips .chip')].filter(c => !c.disabled && !c.dataset.end);
       await tap(chips[answers[i]] || first);
-      await sleep(600);
+      await sleep(300);
     }
 
     // ideas that fit, partner offers first
     await waitFor(q('[data-guide-start]'), 20000);
-    pace = .65;                                            // the ideas part moves along faster
+    pace = .5;                                             // the ideas part moves along faster still
     say('Then it builds ideas that fit your answers, with offers from partners first.', '✨');
     await sleep(2500);
     say('Partner offers are limited, and picked just for you. Claim one before it is gone.', '🎁');
@@ -344,7 +362,7 @@
     { label: 'scene1', title: "Let's get to know each other", play: scene1, pace: .55 },
     { label: 'scene2', title: 'Prove it, keep your stake', play: scene2 },
     { label: 'scene3', title: 'Stuck? Bail out', play: scene3 },
-    { label: 'scene4', title: 'Not sure what to pick?', play: scene4 }
+    { label: 'scene4', title: 'Not sure what to pick?', play: scene4, pace: .8 }
   ];
   const buttons = [];
   const lock = on => {
